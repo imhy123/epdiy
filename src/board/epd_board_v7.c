@@ -17,6 +17,21 @@
 
 #include <stdio.h>
 
+// Custom boards based on the epdiy V7 schematic sometimes omit the PCA9555 IO
+// expander and do not expose the TPS65185 PMIC to software over I2C: the EPD
+// power rails come up autonomously in hardware and VCOM is set with the onboard
+// potentiometer. On such boards the stock V7 code aborts in epd_board_init
+// (PCA9555 NACK -> ESP_ERR_INVALID_STATE) or hangs forever in the PWRGOOD / PG
+// wait loops.
+//
+// When this is 1 (the default on the feature/disable_pca9555_tps65185 branch),
+// every PCA9555/TPS65185 I2C access is compiled out and power is assumed to be
+// brought up in hardware. Define it to 0 to restore the stock behaviour for a
+// real V7 board with the IO expander populated.
+#ifndef EPD_BOARD_V7_DISABLE_IO_EXPANDER
+#define EPD_BOARD_V7_DISABLE_IO_EXPANDER 1
+#endif
+
 // Make this compile von the ESP32 without ifdefing the whole file
 #ifndef CONFIG_IDF_TARGET_ESP32S3
 #define GPIO_NUM_40 -1
@@ -78,23 +93,27 @@ typedef struct {
     bool others[8];
 } epd_config_register_t;
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
 static const epd_board_i2c_bus_config_t board_i2c_config = {
     .port = I2C_NUM_0,
     .sda_io_num = CFG_SDA,
     .scl_io_num = CFG_SCL,
     .bus_speed_hz = 100000,
 };
+#endif
 
 /** The VCOM voltage to use. */
 static int vcom = 1600;
 
 static epd_config_register_t config_reg;
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
 static bool interrupt_done = false;
 
 static void IRAM_ATTR interrupt_handler(void* arg) {
     interrupt_done = true;
 }
+#endif
 
 static lcd_bus_config_t lcd_config = {
     .clock = CKH,
@@ -123,8 +142,12 @@ static lcd_bus_config_t lcd_config = {
 static void epd_board_init(uint32_t epd_row_width, const EpdInitConfig* init_config) {
     gpio_hold_dis(CKH);  // free CKH after wakeup
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     ESP_ERROR_CHECK(epd_board_i2c_init(&config_reg.i2c, &board_i2c_config, init_config, true, true)
     );
+#else
+    (void)init_config;  // power is brought up in hardware; no I2C bus needed
+#endif
     config_reg.pwrup = false;
     config_reg.vcom_ctrl = false;
     config_reg.wakeup = false;
@@ -132,6 +155,7 @@ static void epd_board_init(uint32_t epd_row_width, const EpdInitConfig* init_con
         config_reg.others[i] = false;
     }
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     gpio_set_direction(CFG_INTR, GPIO_MODE_INPUT);
     gpio_set_intr_type(CFG_INTR, GPIO_INTR_NEGEDGE);
 
@@ -141,6 +165,7 @@ static void epd_board_init(uint32_t epd_row_width, const EpdInitConfig* init_con
 
     // set all epdiy lines to output except TPS interrupt + PWR good
     ESP_ERROR_CHECK(pca9555_set_config(config_reg.i2c.pca, CFG_PIN_PWRGOOD | CFG_PIN_INT, 1));
+#endif
 
     const EpdDisplay_t* display = epd_get_display();
 
@@ -158,6 +183,7 @@ static void epd_board_init(uint32_t epd_row_width, const EpdInitConfig* init_con
 static void epd_board_deinit() {
     epd_lcd_deinit();
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     ESP_ERROR_CHECK(pca9555_set_config(
         config_reg.i2c.pca, CFG_PIN_PWRGOOD | CFG_PIN_INT | CFG_PIN_VCOM_CTRL | CFG_PIN_PWRUP, 1
     ));
@@ -180,9 +206,11 @@ static void epd_board_deinit() {
     epd_board_i2c_deinit(&config_reg.i2c);
 
     gpio_uninstall_isr_service();
+#endif
 }
 
 static void epd_board_set_ctrl(epd_ctrl_state_t* state, const epd_ctrl_state_t* const mask) {
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     uint8_t value = 0x00;
     if (mask->ep_output_enable || mask->ep_mode || mask->ep_stv) {
         if (state->ep_output_enable)
@@ -199,6 +227,11 @@ static void epd_board_set_ctrl(epd_ctrl_state_t* state, const epd_ctrl_state_t* 
 
         ESP_ERROR_CHECK(pca9555_set_value(config_reg.i2c.pca, value, 1));
     }
+#else
+    // No IO expander: the control lines are not software-driven on this board.
+    (void)state;
+    (void)mask;
+#endif
 }
 
 static void epd_board_poweron(epd_ctrl_state_t* state) {
@@ -213,6 +246,7 @@ static void epd_board_poweron(epd_ctrl_state_t* state) {
     config_reg.wakeup = true;
     epd_board_set_ctrl(state, &mask);
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     // Check if DISPLAY_UPSEQ_MC2 is set
     const EpdDisplay_t* display = epd_get_display();
     if (display->display_type & DISPLAY_UPSEQ_MC2) {
@@ -220,6 +254,7 @@ static void epd_board_poweron(epd_ctrl_state_t* state) {
         tps_set_upseq_carta1300();
         printf("Setting UPSEQ for DISPLAY_UPSEQ_MC2\n");
     }
+#endif
     config_reg.pwrup = true;
     epd_board_set_ctrl(state, &mask);
     config_reg.vcom_ctrl = true;
@@ -228,12 +263,14 @@ static void epd_board_poweron(epd_ctrl_state_t* state) {
     // give the IC time to powerup and set lines
     vTaskDelay(1);
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     while (!(pca9555_read_input(config_reg.i2c.pca, 1) & CFG_PIN_PWRGOOD)) {
     }
 
     ESP_ERROR_CHECK(tps_write_register(config_reg.i2c.tps, TPS_REG_ENABLE, 0x3F));
 
     tps_set_vcom(config_reg.i2c.tps, vcom);
+#endif
 
     state->ep_sth = true;
     mask = (const epd_ctrl_state_t){
@@ -241,6 +278,7 @@ static void epd_board_poweron(epd_ctrl_state_t* state) {
     };
     epd_board_set_ctrl(state, &mask);
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     int tries = 0;
     while (!((tps_read_register(config_reg.i2c.tps, TPS_REG_PG) & 0xFA) == 0xFA)) {
         if (tries >= 500) {
@@ -254,6 +292,7 @@ static void epd_board_poweron(epd_ctrl_state_t* state) {
         tries++;
         vTaskDelay(1);
     }
+#endif
 }
 
 static void epd_board_measure_vcom(epd_ctrl_state_t* state) {
@@ -278,6 +317,7 @@ static void epd_board_measure_vcom(epd_ctrl_state_t* state) {
     };
     epd_board_set_ctrl(state, &mask);
 
+#if !EPD_BOARD_V7_DISABLE_IO_EXPANDER
     while (!(pca9555_read_input(config_reg.i2c.pca, 1) & CFG_PIN_PWRGOOD)) {
     }
     ESP_LOGI("epdiy", "Power rails enabled");
@@ -301,6 +341,7 @@ static void epd_board_measure_vcom(epd_ctrl_state_t* state) {
         tries++;
         vTaskDelay(1);
     }
+#endif
 }
 
 static void epd_board_poweroff(epd_ctrl_state_t* state) {
