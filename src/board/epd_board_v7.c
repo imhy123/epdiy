@@ -49,6 +49,12 @@
 #define CFG_SDA GPIO_NUM_39
 #define CFG_INTR GPIO_NUM_38
 
+// Custom board (no IO expander): the EPD power rails are gated by a single
+// active-high enable on GPIO46. The seller's Arduino examples drive this
+// directly (epd_poweron/off == digitalWrite(46, 1/0)); here we drive it from
+// the board poweron/poweroff hooks. Only used when the IO expander is disabled.
+#define CFG_PWR_EN GPIO_NUM_46
+
 #define CFG_PIN_OE (PCA_PIN_PC10 >> 8)
 #define CFG_PIN_MODE (PCA_PIN_PC11 >> 8)
 #define __CFG_PIN_STV (PCA_PIN_PC12 >> 8)
@@ -147,6 +153,9 @@ static void epd_board_init(uint32_t epd_row_width, const EpdInitConfig* init_con
     );
 #else
     (void)init_config;  // power is brought up in hardware; no I2C bus needed
+    // EPD power enable (GPIO46), start powered off.
+    gpio_set_direction(CFG_PWR_EN, GPIO_MODE_OUTPUT);
+    gpio_set_level(CFG_PWR_EN, 0);
 #endif
     config_reg.pwrup = false;
     config_reg.vcom_ctrl = false;
@@ -235,6 +244,11 @@ static void epd_board_set_ctrl(epd_ctrl_state_t* state, const epd_ctrl_state_t* 
 }
 
 static void epd_board_poweron(epd_ctrl_state_t* state) {
+#if EPD_BOARD_V7_DISABLE_IO_EXPANDER
+    // Enable the EPD power rails (active-high) and give them time to come up.
+    gpio_set_level(CFG_PWR_EN, 1);
+    vTaskDelay(pdMS_TO_TICKS(20));
+#endif
     epd_ctrl_state_t mask = {
         .ep_output_enable = true,
         .ep_mode = true,
@@ -359,6 +373,11 @@ static void epd_board_poweroff(epd_ctrl_state_t* state) {
     vTaskDelay(1);
     config_reg.wakeup = false;
     epd_board_set_ctrl(state, &mask);
+
+#if EPD_BOARD_V7_DISABLE_IO_EXPANDER
+    // Disable the EPD power rails.
+    gpio_set_level(CFG_PWR_EN, 0);
+#endif
 }
 
 static float epd_board_ambient_temperature() {
